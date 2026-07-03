@@ -1,10 +1,11 @@
 import os
-import json
 import logging
 import asyncio
 import glob
 from contextlib import asynccontextmanager
 
+import ijson
+import requests
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
@@ -12,7 +13,6 @@ from fastapi import FastAPI, Request, Response, status
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-# Cấu hình log hệ thống
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     level=logging.INFO
@@ -27,7 +27,7 @@ tg_application = Application.builder().token(BOT_TOKEN).build()
 
 # --- HÀM LÀM SẠCH HỆ THỐNG ---
 def clear_system_cached_files():
-    logger.info("🧹 Đang kích hoạt lệnh quét dọn hệ thống...")
+    logger.info("🧹 Đang dọn dẹp hệ thống...")
     count = 0
     patterns = ["temp_*", "*_converted.xlsx"]
     for pattern in patterns:
@@ -35,28 +35,29 @@ def clear_system_cached_files():
             try:
                 if os.path.exists(filepath):
                     os.remove(filepath)
-                    logger.info(f"🗑️ Đã xóa file rác: {filepath}")
                     count += 1
             except Exception as e:
-                logger.error(f"❌ Không thể xóa file {filepath}: {str(e)}")
+                logger.error(f"❌ Lỗi xóa {filepath}: {str(e)}")
     return count
 
-# --- HÀM CHUYỂN ĐỔI FILE CORE (CHẠY TRONG THREAD RIÊNG) ---
-def convert_json_to_styled_excel_heavy(json_filepath, excel_filepath, queue, loop):
+# --- TẢI FILE DUNG LƯỢNG LỚN (STREAM CHUNK) ---
+def download_file_low_ram(url, dest_path):
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(dest_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=65536): # Đọc chunk 64KB
+                f.write(chunk)
+
+# --- XỬ LÝ JSON 100MB ĐÚNG 1 LƯỢT DUY NHẤT (SINGLE-PASS) ---
+def convert_heavy_json_to_excel(json_filepath, excel_filepath, queue, loop):
     try:
-        logger.info(f"🔄 Bắt đầu phân tích file: {json_filepath}")
-        with open(json_filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        cols = data.get('cols', [])
-        students_data = data.get('students', {})
-        total_students = len(students_data)
+        logger.info(f"⚡ Bắt đầu quét Single-Pass file: {json_filepath}")
         
         wb = openpyxl.Workbook(write_only=True)
         ws = wb.create_sheet(title="DiemThi")
         ws.views.sheetView[0].showGridLines = True
         
-        # Styles tiêu chuẩn cao
+        # Styles
         header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
         header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -69,112 +70,163 @@ def convert_json_to_styled_excel_heavy(json_filepath, excel_filepath, queue, loo
         
         zebra_fill = PatternFill(start_color="F2F5F8", end_color="F2F5F8", fill_type="solid")
         white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-        
-        header_row = ["SBD"] + cols
-        header_cells = []
-        for val in header_row:
-            cell = openpyxl.cell.WriteOnlyCell(ws, value=val)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = header_alignment
-            cell.border = border_all
-            header_cells.append(cell)
-        ws.append(header_cells)
-        
-        last_reported_percentage = 0
-        for idx, (sbd, scores) in enumerate(students_data.items(), start=1):
-            row_fill = zebra_fill if idx % 2 == 0 else white_fill
-            row_cells = []
+
+        cols = []
+        header_written = False
+        student_count = 0
+
+        # Mở file dưới dạng nhị phân để ijson phân tích cú pháp dạng stream
+        with open(json_filepath, 'rb') as f:
+            parser = ijson.parse(f)
             
-            sbd_cell = openpyxl.cell.WriteOnlyCell(ws, value=sbd)
-            sbd_cell.font = data_font
-            sbd_cell.alignment = sbd_alignment
-            sbd_cell.fill = row_fill
-            sbd_cell.border = border_all
-            row_cells.append(sbd_cell)
-            
-            for i in range(len(cols)):
-                score_val = scores[i] if i < len(scores) else None
-                score_cell = openpyxl.cell.WriteOnlyCell(ws, value=score_val)
-                score_cell.font = data_font
-                score_cell.alignment = score_alignment
-                score_cell.fill = row_fill
-                score_cell.border = border_all
-                if score_val is not None and isinstance(score_val, (int, float)):
-                    score_cell.number_format = '0.00'
-                row_cells.append(score_cell)
-                
-            ws.append(row_cells)
-            
-            if total_students > 0:
-                percentage = int((idx / total_students) * 100)
-                if percentage >= last_reported_percentage + 10 or percentage == 100:
-                    last_reported_percentage = percentage
-                    loop.call_soon_threadsafe(queue.put_nowait, percentage)
+            current_sbd = None
+            current_scores = []
+            in_cols = False
+            in_students = False
+            in_student_scores = False
+
+            for prefix, event, value in parser:
+                # 1. Trích xuất danh sách cột (cols)
+                if prefix == 'cols' and event == 'start_array':
+                    in_cols = True
+                    continue
+                if in_cols:
+                    if event == 'string':
+                        cols.append(value)
+                    elif event == 'end_array':
+                        in_cols = False
+                    continue
+
+                # 2. Định vị khu vực học sinh (students)
+                if prefix == 'students' and event == 'start_map':
+                    in_students = True
+                    # Ghi ngay dòng Header khi vừa đọc xong cấu trúc cols và chạm tới students
+                    if not header_written:
+                        header_row = ["SBD"] + cols
+                        header_cells = []
+                        for val in header_row:
+                            cell = openpyxl.cell.WriteOnlyCell(ws, value=val)
+                            cell.font = header_font
+                            cell.fill = header_fill
+                            cell.alignment = header_alignment
+                            cell.border = border_all
+                            header_cells.append(cell)
+                        ws.append(header_cells)
+                        header_written = True
+                    continue
+
+                if in_students:
+                    if prefix == 'students' and event == 'map_key':
+                        current_sbd = value  # Lấy được SBD
+                    elif prefix == f'students.{current_sbd}' and event == 'start_array':
+                        in_student_scores = True
+                        current_scores = []
+                    elif in_student_scores:
+                        if event in ('number', 'integer', 'double'):
+                            current_scores.append(value)
+                        elif event == 'null':
+                            current_scores.append(None)
+                        elif event == 'end_array':
+                            in_student_scores = False
+                            student_count += 1
+                            
+                            # Ghi dữ liệu học sinh này xuống đĩa ngay lập tức
+                            row_fill = zebra_fill if student_count % 2 == 0 else white_fill
+                            row_cells = []
+                            
+                            sbd_cell = openpyxl.cell.WriteOnlyCell(ws, value=current_sbd)
+                            sbd_cell.font = data_font
+                            sbd_cell.alignment = sbd_alignment
+                            sbd_cell.fill = row_fill
+                            sbd_cell.border = border_all
+                            row_cells.append(sbd_cell)
+                            
+                            for i in range(len(cols)):
+                                score_val = current_scores[i] if i < len(current_scores) else None
+                                score_cell = openpyxl.cell.WriteOnlyCell(ws, value=score_val)
+                                score_cell.font = data_font
+                                score_cell.alignment = score_alignment
+                                score_cell.fill = row_fill
+                                score_cell.border = border_all
+                                if score_val is not None and isinstance(score_val, (int, float)):
+                                    score_cell.number_format = '0.00'
+                                row_cells.append(score_cell)
+                            
+                            ws.append(row_cells)
+                            
+                            # Cứ mỗi 5000 thí sinh thì gửi cập nhật tiến độ (tránh spam nghẽn mạng)
+                            if student_count % 5000 == 0:
+                                loop.call_soon_threadsafe(queue.put_nowait, student_count)
+                                
+                    elif prefix == 'students' and event == 'end_map':
+                        in_students = False
 
         wb.save(excel_filepath)
         wb.close()
-        logger.info(f"✨ Ghi xong file xuất ra: {excel_filepath}")
+        logger.info(f"✨ Đã xuất xong file Excel khổng lồ ({student_count} dòng).")
+        # Trả về kết quả tổng số dòng đã ghi thành công
+        loop.call_soon_threadsafe(queue.put_nowait, f"DONE_{student_count}")
+        
     except Exception as e:
-        logger.error(f"❌ Lỗi xuất Excel: {str(e)}")
-    finally:
+        logger.error(f"❌ Thất bại khi parse file lớn: {str(e)}")
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
-# --- TIẾN TRÌNH NỀN: XỬ LÝ BACKGROUND KHÔNG LÀM ĐƠ WEBHOOK ---
+# --- TIẾN TRÌNH CHẠY NGẦM KHÔNG TREO BOT ---
 async def process_file_background(chat_id, file_id, file_name):
     base_name = os.path.splitext(file_name)[0]
     json_path = f"temp_{file_id}_{file_name}"
     excel_path = f"{base_name}_{file_id}_converted.xlsx"
     
-    # Tạo tin nhắn trạng thái ban đầu
     status_message = await tg_application.bot.send_message(
         chat_id=chat_id, 
-        text="📥 Đã nhận file vào hàng đợi thành công! Đang tải xuống... [0%]"
+        text="📥 Đã xếp hàng file lớn thành công! Đang tải xuống đĩa cứng..."
     )
     
     try:
-        # 1. Tải file về đĩa cứng
         tg_file = await tg_application.bot.get_file(file_id)
-        await tg_file.download_to_drive(json_path)
-        
-        queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
         
-        # 2. Đẩy vào luồng chạy ngầm độc lập
+        # Tải file lớn bằng Stream Chunking
+        await loop.run_in_executor(None, download_file_low_ram, tg_file.file_path, json_path)
+        await status_message.edit_text("⏳ Đang phân tích dữ liệu ngầm (RAM An Toàn)... Đang xử lý dòng 0...")
+        
+        queue = asyncio.Queue()
         convert_task = loop.run_in_executor(
-            None, convert_json_to_styled_excel_heavy, json_path, excel_path, queue, loop
+            None, convert_heavy_json_to_excel, json_path, excel_path, queue, loop
         )
         
-        # 3. Lắng nghe % tiến độ để cập nhật lên đoạn chat
         while True:
-            percentage = await queue.get()
-            if percentage is None:
+            res = await queue.get()
+            if res is None:
+                raise Exception("Lỗi xuất file trong executor")
+            if isinstance(res, str) and res.startswith("DONE_"):
+                total_row = res.split("_")[1]
                 break
+            # Cập nhật số dòng xử lý theo thời gian thực
             try:
-                await status_message.edit_text(f"⏳ Đang chuyển hóa dữ liệu... [{percentage}%]")
+                await status_message.edit_text(f"⏳ Đang chuyển hóa dữ liệu lớn... Đã ghi {res} dòng thí sinh.")
             except Exception:
                 pass
                 
         await convert_task
-        await status_message.edit_text("📤 Đã xử lý xong 100%! Đang chuẩn bị chuyển file trả bạn...")
+        await status_message.edit_text(f"📤 Đã chuyển hóa thành công {total_row} thí sinh! Đang upload file Excel lên Telegram...")
         
-        # 4. Gửi trả file thành phẩm Excel
+        # Gửi file trực tiếp từ đĩa (không đọc cả file vào RAM)
         with open(excel_path, 'rb') as excel_file:
             await tg_application.bot.send_document(
                 chat_id=chat_id,
                 document=excel_file,
                 filename=f"{base_name}.xlsx",
-                caption="🎉 Đã chuyển đổi thành công sang định dạng .xlsx chuẩn!"
+                caption=f"🎉 Hoàn thành chuyển đổi file lớn!\n📊 Tổng số dòng: {total_row}\n🤖 Chế độ tối ưu hóa RAM 512MB hoạt động hoàn hảo."
             )
             
     except Exception as e:
-        logger.error(f"🚨 Lỗi tiến trình ngầm: {str(e)}")
+        logger.error(f"🚨 Lỗi nghiêm trọng luồng nền: {str(e)}")
         try:
-            await tg_application.bot.send_message(chat_id=chat_id, text="💥 Đã xảy ra lỗi không mong muốn trong lúc chuyển file.")
+            await tg_application.bot.send_message(chat_id=chat_id, text="💥 Đã xảy ra sự cố do file quá lớn hoặc lỗi cấu trúc JSON.")
         except Exception:
             pass
     finally:
-        # Tự dọn dẹp file tạm ngay lập tức sau khi hoàn thành/lỗi
         if os.path.exists(json_path): os.remove(json_path)
         if os.path.exists(excel_path): os.remove(excel_path)
         try:
@@ -182,17 +234,17 @@ async def process_file_background(chat_id, file_id, file_name):
         except Exception:
             pass
 
-# --- ĐIỀU HƯỚNG LỆNH TELEGRAM ---
+# --- XỬ LÝ LỆNH ---
 async def start_command(update: Update, context):
     loop = asyncio.get_running_loop()
     deleted_files_count = await loop.run_in_executor(None, clear_system_cached_files)
     
-    msg = "👋 Hệ thống Web Service đã được làm mới hoàn toàn!\n"
+    msg = "👋 Đã làm mới hệ thống thành công!\n"
     if deleted_files_count > 0:
-        msg += f"🧹 Đã giải phóng sạch sẽ {deleted_files_count} file tạm bị kẹt cũ.\n"
+        msg += f"🧹 Đã quét dọn và hủy hoàn toàn {deleted_files_count} file rác cũ.\n"
     else:
-        msg += "✨ Không có tệp rác nào, hệ thống sạch 100%.\n"
-    msg += "\nHãy gửi file `.json` để tôi bắt đầu chuyển hóa siêu tốc ở chế độ nền (Background)!"
+        msg += "✨ Bộ nhớ đĩa cứng và RAM sạch 100%.\n"
+    msg += "\nHệ thống đã sẵn sàng nhận file dữ liệu lớn (lên tới 100MB+)."
     await update.message.reply_text(msg)
 
 async def handle_document(update: Update, context):
@@ -200,25 +252,23 @@ async def handle_document(update: Update, context):
     file_name = document.file_name
     
     if not file_name.lower().endswith('.json'):
-        await update.message.reply_text("❌ Vui lòng chỉ gửi file có đuôi `.json`.")
+        await update.message.reply_text("❌ Vui lòng gửi tệp tin định dạng `.json`.")
         return
     
-    # 💥 ĐIỂM CỐT LÕI: Tạo Task chạy độc lập ở nền và nhả luồng ngay để phản hồi Webhook lập tức!
     asyncio.create_task(process_file_background(update.effective_chat.id, document.file_id, file_name))
 
 tg_application.add_handler(CommandHandler("start", start_command))
 tg_application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-# --- LIFESPAN WEBHOOK FASTAPI ---
+# --- LIFESPAN FASTAPI ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
-    logger.info(f"🚀 Đang kết nối Webhook bảo mật: {webhook_url}")
+    logger.info(f"🚀 Khởi động Webhook bảo vệ RAM: {webhook_url}")
     await tg_application.initialize()
-    await tg_application.bot.set_webhook(url=webhook_url, drop_pending_updates=True) # Xóa hết tin nhắn kẹt cũ
+    await tg_application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
     await tg_application.start()
     yield
-    logger.info("🛑 Đang đóng kết nối Web Service...")
     await tg_application.bot.delete_webhook()
     await tg_application.stop()
     await tg_application.shutdown()
@@ -227,16 +277,15 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "mode": "async_background_task"}
+    return {"status": "online", "heavy_file_mode": "enabled"}
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     try:
         req_body = await request.json()
         update = Update.de_json(req_body, tg_application.bot)
-        # Không dùng await tg_application.process_update để Webhook phản hồi 200 ngay lập tức
         asyncio.create_task(tg_application.process_update(update))
         return Response(status_code=status.HTTP_200_OK)
     except Exception as e:
-        logger.error(f"🚨 Webhook Error: {str(e)}")
+        logger.error(f"🚨 Webhook lỗi: {str(e)}")
         return Response(status_code=status.HTTP_400_BAD_REQUEST)
