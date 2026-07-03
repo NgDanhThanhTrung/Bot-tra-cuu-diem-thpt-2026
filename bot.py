@@ -2,17 +2,14 @@ import os
 import logging
 import asyncio
 import glob
-from contextlib import asynccontextmanager
-
 import ijson
 import requests
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-
-from fastapi import FastAPI, Request, Response, status
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Cấu hình log hệ thống
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     level=logging.INFO
@@ -20,14 +17,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") 
-PORT = int(os.getenv("PORT", 8000))
-
-tg_application = Application.builder().token(BOT_TOKEN).build()
 
 # --- HÀM LÀM SẠCH HỆ THỐNG ---
 def clear_system_cached_files():
-    logger.info("🧹 Đang dọn dẹp hệ thống...")
+    logger.info("🧹 Đang dọn dẹp file tạm...")
     count = 0
     patterns = ["temp_*", "*_converted.xlsx"]
     for pattern in patterns:
@@ -42,22 +35,23 @@ def clear_system_cached_files():
 
 # --- TẢI FILE DUNG LƯỢNG LỚN (STREAM CHUNK) ---
 def download_file_low_ram(url, dest_path):
+    # Sử dụng requests stream để tải file theo từng block 64KB, tránh đầy RAM
     with requests.get(url, stream=True) as r:
         r.raise_for_status()
         with open(dest_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=65536): # Đọc chunk 64KB
+            for chunk in r.iter_content(chunk_size=65536):
                 f.write(chunk)
 
-# --- XỬ LÝ JSON 100MB ĐÚNG 1 LƯỢT DUY NHẤT (SINGLE-PASS) ---
+# --- XỬ LÝ JSON LỚN ĐÚNG 1 LƯỢT DUY NHẤT (SINGLE-PASS) ---
 def convert_heavy_json_to_excel(json_filepath, excel_filepath, queue, loop):
     try:
-        logger.info(f"⚡ Bắt đầu quét Single-Pass file: {json_filepath}")
+        logger.info(f"⚡ Bắt đầu phân tích Single-Pass: {json_filepath}")
         
         wb = openpyxl.Workbook(write_only=True)
         ws = wb.create_sheet(title="DiemThi")
         ws.views.sheetView[0].showGridLines = True
         
-        # Styles
+        # Styles định dạng cấu trúc Excel đẹp
         header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
         header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -75,18 +69,14 @@ def convert_heavy_json_to_excel(json_filepath, excel_filepath, queue, loop):
         header_written = False
         student_count = 0
 
-        # Mở file dưới dạng nhị phân để ijson phân tích cú pháp dạng stream
         with open(json_filepath, 'rb') as f:
             parser = ijson.parse(f)
-            
             current_sbd = None
             current_scores = []
-            in_cols = False
-            in_students = False
-            in_student_scores = False
+            in_cols, in_students, in_student_scores = False, False, False
 
             for prefix, event, value in parser:
-                # 1. Trích xuất danh sách cột (cols)
+                # 1. Đọc danh sách cột
                 if prefix == 'cols' and event == 'start_array':
                     in_cols = True
                     continue
@@ -97,10 +87,9 @@ def convert_heavy_json_to_excel(json_filepath, excel_filepath, queue, loop):
                         in_cols = False
                     continue
 
-                # 2. Định vị khu vực học sinh (students)
+                # 2. Đọc và ghi dữ liệu học sinh tuần tự
                 if prefix == 'students' and event == 'start_map':
                     in_students = True
-                    # Ghi ngay dòng Header khi vừa đọc xong cấu trúc cols và chạm tới students
                     if not header_written:
                         header_row = ["SBD"] + cols
                         header_cells = []
@@ -117,7 +106,7 @@ def convert_heavy_json_to_excel(json_filepath, excel_filepath, queue, loop):
 
                 if in_students:
                     if prefix == 'students' and event == 'map_key':
-                        current_sbd = value  # Lấy được SBD
+                        current_sbd = value
                     elif prefix == f'students.{current_sbd}' and event == 'start_array':
                         in_student_scores = True
                         current_scores = []
@@ -130,7 +119,6 @@ def convert_heavy_json_to_excel(json_filepath, excel_filepath, queue, loop):
                             in_student_scores = False
                             student_count += 1
                             
-                            # Ghi dữ liệu học sinh này xuống đĩa ngay lập tức
                             row_fill = zebra_fill if student_count % 2 == 0 else white_fill
                             row_cells = []
                             
@@ -154,7 +142,7 @@ def convert_heavy_json_to_excel(json_filepath, excel_filepath, queue, loop):
                             
                             ws.append(row_cells)
                             
-                            # Cứ mỗi 5000 thí sinh thì gửi cập nhật tiến độ (tránh spam nghẽn mạng)
+                            # Cứ 5000 dòng báo cáo 1 lần để không bị lạm phát CPU
                             if student_count % 5000 == 0:
                                 loop.call_soon_threadsafe(queue.put_nowait, student_count)
                                 
@@ -163,32 +151,31 @@ def convert_heavy_json_to_excel(json_filepath, excel_filepath, queue, loop):
 
         wb.save(excel_filepath)
         wb.close()
-        logger.info(f"✨ Đã xuất xong file Excel khổng lồ ({student_count} dòng).")
-        # Trả về kết quả tổng số dòng đã ghi thành công
         loop.call_soon_threadsafe(queue.put_nowait, f"DONE_{student_count}")
         
     except Exception as e:
-        logger.error(f"❌ Thất bại khi parse file lớn: {str(e)}")
+        logger.error(f"❌ Lỗi ghi Excel: {str(e)}")
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
-# --- TIẾN TRÌNH CHẠY NGẦM KHÔNG TREO BOT ---
-async def process_file_background(chat_id, file_id, file_name):
+# --- TIẾN TRÌNH XỬ LÝ NỀN ---
+async def process_file_background(chat_id, file_id, file_name, context: ContextTypes.DEFAULT_TYPE):
     base_name = os.path.splitext(file_name)[0]
     json_path = f"temp_{file_id}_{file_name}"
     excel_path = f"{base_name}_{file_id}_converted.xlsx"
     
-    status_message = await tg_application.bot.send_message(
+    status_message = await context.bot.send_message(
         chat_id=chat_id, 
-        text="📥 Đã xếp hàng file lớn thành công! Đang tải xuống đĩa cứng..."
+        text="📥 Đã tiếp nhận file! Đang streaming tải xuống đĩa cứng..."
     )
     
     try:
-        tg_file = await tg_application.bot.get_file(file_id)
+        # Lấy thông tin URL tải file trực tiếp từ Telegram
+        tg_file = await context.bot.get_file(file_id)
         loop = asyncio.get_running_loop()
         
-        # Tải file lớn bằng Stream Chunking
+        # Chạy tải file ngầm tiết kiệm bộ nhớ
         await loop.run_in_executor(None, download_file_low_ram, tg_file.file_path, json_path)
-        await status_message.edit_text("⏳ Đang phân tích dữ liệu ngầm (RAM An Toàn)... Đang xử lý dòng 0...")
+        await status_message.edit_text("⏳ Đang bóc tách dữ liệu Single-Pass... Đã ghi 0 dòng.")
         
         queue = asyncio.Queue()
         convert_task = loop.run_in_executor(
@@ -198,32 +185,34 @@ async def process_file_background(chat_id, file_id, file_name):
         while True:
             res = await queue.get()
             if res is None:
-                raise Exception("Lỗi xuất file trong executor")
+                raise Exception("Lỗi cấu trúc dữ liệu JSON.")
             if isinstance(res, str) and res.startswith("DONE_"):
                 total_row = res.split("_")[1]
                 break
-            # Cập nhật số dòng xử lý theo thời gian thực
             try:
-                await status_message.edit_text(f"⏳ Đang chuyển hóa dữ liệu lớn... Đã ghi {res} dòng thí sinh.")
+                await status_message.edit_text(f"⏳ Đang chuyển đổi... Đã xử lý {res} dòng thí sinh.")
             except Exception:
                 pass
                 
         await convert_task
-        await status_message.edit_text(f"📤 Đã chuyển hóa thành công {total_row} thí sinh! Đang upload file Excel lên Telegram...")
+        await status_message.edit_text("📤 Đang stream upload file Excel thành phẩm...")
         
-        # Gửi file trực tiếp từ đĩa (không đọc cả file vào RAM)
+        # Đẩy file trực tiếp từ đĩa cứng trả lại cho người dùng
         with open(excel_path, 'rb') as excel_file:
-            await tg_application.bot.send_document(
+            await context.bot.send_document(
                 chat_id=chat_id,
                 document=excel_file,
                 filename=f"{base_name}.xlsx",
-                caption=f"🎉 Hoàn thành chuyển đổi file lớn!\n📊 Tổng số dòng: {total_row}\n🤖 Chế độ tối ưu hóa RAM 512MB hoạt động hoàn hảo."
+                caption=f"🎉 Chuyển đổi thành công!\n📊 Tổng cộng: {total_row} dòng thí sinh.\n🤖 Chạy mượt mà trên giới hạn RAM 512MB."
             )
             
     except Exception as e:
-        logger.error(f"🚨 Lỗi nghiêm trọng luồng nền: {str(e)}")
+        logger.error(f"🚨 Lỗi luồng nền: {str(e)}")
         try:
-            await tg_application.bot.send_message(chat_id=chat_id, text="💥 Đã xảy ra sự cố do file quá lớn hoặc lỗi cấu trúc JSON.")
+            await context.bot.send_message(
+                chat_id=chat_id, 
+                text="💥 Lỗi: File quá lớn vượt giới hạn Bot API (Tối đa 50MB cho Bot thường) hoặc sai cấu trúc JSON."
+            )
         except Exception:
             pass
     finally:
@@ -234,58 +223,33 @@ async def process_file_background(chat_id, file_id, file_name):
         except Exception:
             pass
 
-# --- XỬ LÝ LỆNH ---
-async def start_command(update: Update, context):
+# --- ĐIỀU HƯỚNG SỰ KIỆN BOT ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
     deleted_files_count = await loop.run_in_executor(None, clear_system_cached_files)
-    
-    msg = "👋 Đã làm mới hệ thống thành công!\n"
-    if deleted_files_count > 0:
-        msg += f"🧹 Đã quét dọn và hủy hoàn toàn {deleted_files_count} file rác cũ.\n"
-    else:
-        msg += "✨ Bộ nhớ đĩa cứng và RAM sạch 100%.\n"
-    msg += "\nHệ thống đã sẵn sàng nhận file dữ liệu lớn (lên tới 100MB+)."
+    msg = f"👋 Chào mừng bạn! Bot chạy chế độ Long Polling tối ưu RAM.\n🧹 Đã dọn sạch {deleted_files_count} file tạm.\n\nHãy gửi file `.json` để bắt đầu xử lý!"
     await update.message.reply_text(msg)
 
-async def handle_document(update: Update, context):
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     file_name = document.file_name
     
     if not file_name.lower().endswith('.json'):
-        await update.message.reply_text("❌ Vui lòng gửi tệp tin định dạng `.json`.")
+        await update.message.reply_text("❌ Vui lòng chỉ gửi file có đuôi định dạng `.json`.")
         return
     
-    asyncio.create_task(process_file_background(update.effective_chat.id, document.file_id, file_name))
+    # Kích hoạt hàm xử lý ngầm, không block luồng nhận tin nhắn tiếp theo
+    asyncio.create_task(process_file_background(update.effective_chat.id, document.file_id, file_name, context))
 
-tg_application.add_handler(CommandHandler("start", start_command))
-tg_application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+def main():
+    logger.info("🚀 Bot thuần đang khởi chạy vòng lặp Long Polling...")
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    # Khởi chạy long polling, tự động xóa webhook cũ nếu có để tránh xung đột
+    application.run_polling(drop_pending_updates=True)
 
-# --- LIFESPAN FASTAPI ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
-    logger.info(f"🚀 Khởi động Webhook bảo vệ RAM: {webhook_url}")
-    await tg_application.initialize()
-    await tg_application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    await tg_application.start()
-    yield
-    await tg_application.bot.delete_webhook()
-    await tg_application.stop()
-    await tg_application.shutdown()
-
-app = FastAPI(lifespan=lifespan)
-
-@app.get("/")
-def health_check():
-    return {"status": "online", "heavy_file_mode": "enabled"}
-
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
-    try:
-        req_body = await request.json()
-        update = Update.de_json(req_body, tg_application.bot)
-        asyncio.create_task(tg_application.process_update(update))
-        return Response(status_code=status.HTTP_200_OK)
-    except Exception as e:
-        logger.error(f"🚨 Webhook lỗi: {str(e)}")
-        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+if __name__ == '__main__':
+    main()
