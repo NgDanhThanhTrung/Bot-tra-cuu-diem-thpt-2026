@@ -201,8 +201,9 @@ async def handle_document(update: Update, context):
         except Exception:
             pass
 
+# --- ĐĂNG KÝ CÁC BỘ LỌC ĐÃ SỬA CÚ PHÁP CHUẨN ---
 tg_application.add_handler(CommandHandler("start", start_command))
-tg_application.add_handler(filters.Document.ALL & MessageHandler(filters.Document.ALL, handle_document))
+tg_application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 # --- CẤU HÌNH WEBHOOK LIFESPAN CHO FASTAPI ---
 @asynccontextmanager
